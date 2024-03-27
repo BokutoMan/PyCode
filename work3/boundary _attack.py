@@ -1,29 +1,15 @@
 import torch
-import torchvision
-import torchvision.transforms as transforms
-import torch.nn as nn
-import torch.optim as optim
-import numpy as np
+import torchvision.models as models
+import torchvision.transforms as transforms,datasets
+from PIL import Image
 
-# 加载 MNIST 数据集
-transform = transforms.Compose([
-    transforms.ToTensor(),
-])
+# 加载预训练的 ResNet-18 模型
+model = models.resnet18(pretrained=True)
+model.eval()
 
-trainset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-trainloader = torch.utils.data.DataLoader(trainset, batch_size=64, shuffle=True)
 
-testset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
-testloader = torch.utils.data.DataLoader(testset, batch_size=64, shuffle=False)
-
-# 定义 ResNet-18 模型作为被攻击模型
-model = torchvision.models.resnet18(pretrained=False)
-model.fc = nn.Linear(512, 10)  # 将最后的全连接层修改为输出10个类别
-model = model.cuda()  # 将模型移动到GPU上
-model.train()
-
-# 定义边界攻击函数
-def boundary_attack(model, image, label, max_queries=1000, epsilon=0.03):
+# 定义 R1 攻击函数
+def r1_attack(model, image, max_queries=1000, target=None, epsilon=0.03):
     original_image = image.clone().detach()
     query_count = 0
     
@@ -32,40 +18,46 @@ def boundary_attack(model, image, label, max_queries=1000, epsilon=0.03):
         perturbed_image = image + perturbation
         perturbed_image = torch.clamp(perturbed_image, 0, 1)  # 确保像素值在合法范围内
 
-        output = model(perturbed_image.cuda())
+        output = model(perturbed_image)
         _, predicted = torch.max(output, 1)
         
         query_count += 1
         
-        if predicted.item() == label:
-            return True, query_count  # 有目标攻击成功
-        elif predicted.item() != label:
-            return False, query_count  # 无目标攻击成功
+        if target is not None and predicted.item() == target:
+            # 如果是有目标攻击并且攻击成功，则返回对抗样本和查询次数
+            return perturbed_image, query_count
+        elif target is None and predicted.item() != target:
+            # 如果是无目标攻击并且攻击成功，则返回对抗样本和查询次数
+            return perturbed_image, query_count
     
-    return False, max_queries  # 攻击失败
+    # 如果达到最大查询次数仍未成功，则返回原始图像和最大查询次数
+    return original_image, max_queries
 
-# 统计攻击成功率
-total_samples = len(testset)
-targeted_attack_successes = 0
-untargeted_attack_successes = 0
+# 加载图像并进行预处理
+data_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+BATCH_SIZE = 1
+# 加载数据集，指定训练或测试数据，指定于处理方式
+train_data = datasets.CIFAR10(root='./CIFAR10/', train=True, transform=data_transform["train"], download=True)
+test_data = datasets.CIFAR10(root='./CIFAR10/', train=False, transform=data_transform["val"], download=True)
 
-for images, labels in testloader:
-    images = images.cuda()
-    labels = labels.cuda()
-    
-    for i in range(len(images)):
-        image = images[i:i+1]
-        label = labels[i].item()
-        
-        # 有目标攻击
-        targeted_success, _ = boundary_attack(model, image, label)
-        if targeted_success:
-            targeted_attack_successes += 1
-        
-        # 无目标攻击
-        untargeted_success, _ = boundary_attack(model, image, label, target=np.random.choice([i for i in range(10) if i != label]))
-        if untargeted_success:
-            untargeted_attack_successes += 1
+train_dataloader = torch.utils.data.DataLoader(train_data, BATCH_SIZE, True, num_workers=0)
+test_dataloader = torch.utils.data.DataLoader(test_data, BATCH_SIZE, False, num_workers=0)
 
-print(f"有目标攻击成功率: {targeted_attack_successes / total_samples * 100}%")
-print(f"无目标攻击成功率: {untargeted_attack_successes / total_samples * 100}%")
+
+# image_path = 'OIP-C.png'  # 替换为您的图像路径
+# image = Image.open(image_path)
+# image = data_transform(image).unsqueeze(0)  # 添加批次维度
+for image in train_dataloader:
+
+    # 执行 R1 攻击
+    adversarial_image, queries = r1_attack(model, image, target=3, epsilon=0.03)
+
+    # 保存对抗样本
+    adversarial_image = adversarial_image.squeeze(0)
+    adversarial_image = transforms.ToPILImage()(adversarial_image)
+    adversarial_image.save('adversarial_image.png')
+
+    print(f"攻击成功！查询次数：{queries}")
